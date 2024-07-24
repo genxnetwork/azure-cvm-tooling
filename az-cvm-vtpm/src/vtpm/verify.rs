@@ -5,7 +5,7 @@ use super::{Quote, QuoteError};
 use openssl::pkey::{PKey, Public};
 use openssl::{hash::MessageDigest, sha::Sha256, sign::Verifier};
 use thiserror::Error;
-use tss_esapi::structures::{Attest, AttestInfo};
+use tss_esapi::structures::{Attest, AttestInfo, Digest};
 use tss_esapi::traits::UnMarshall;
 
 #[non_exhaustive]
@@ -61,24 +61,26 @@ impl Quote {
         Ok(())
     }
 
-    /// Verify that the TPM Quote's PCR digest matches the digest of the bundled PCR values
-    ///
-    pub fn verify_pcrs(&self) -> Result<(), VerifyError> {
+    fn pcr_digest(&self) -> Result<Digest, VerifyError> {
         let attest = Attest::unmarshall(&self.message)?;
         let AttestInfo::Quote { info } = attest.attested() else {
             return Err(VerifyError::Quote(QuoteError::NotAQuote));
         };
+        Ok(info.pcr_digest().clone())
+    }
 
-        let pcr_digest = info.pcr_digest();
-
-        // Read hashes of all the PCRs.
+    /// Verify that the TPM Quote's PCR digest matches the digest of the bundled PCR values
+    ///
+    pub fn verify_pcrs(&self) -> Result<(), VerifyError> {
         let mut hasher = Sha256::new();
-        for pcr in self.pcrs.iter() {
-            hasher.update(pcr);
+        for pcr_bank in &self.pcr_banks {
+            for pcr in pcr_bank.pcr_values.iter() {
+                hasher.update(pcr);
+            }
         }
+        let digest = hasher.finish().to_vec();
 
-        let digest = hasher.finish();
-        if digest[..] != pcr_digest[..] {
+        if digest[..] != self.pcr_digest()?[..] {
             return Err(VerifyError::PcrMismatch);
         }
 
