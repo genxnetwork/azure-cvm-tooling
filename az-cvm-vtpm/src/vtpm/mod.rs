@@ -228,7 +228,7 @@ impl Algorithm {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PcrBank {
-    algo: Algorithm,
+    pub algo: Algorithm,
     pub pcr_values: Vec<Vec<u8>>,
 }
 
