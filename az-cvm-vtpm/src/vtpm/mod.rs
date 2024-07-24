@@ -208,9 +208,14 @@ impl Algorithm {
             Algorithm::Sha256 => SHA256_LENGTH,
         }
     }
-}
 
-impl Algorithm {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Algorithm::Sha1 => "sha1",
+            Algorithm::Sha256 => "sha256",
+        }
+    }
+
     pub fn tss_esapi(&self) -> tss_esapi::interface_types::algorithm::HashingAlgorithm {
         match self {
             Algorithm::Sha1 => tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha1,
