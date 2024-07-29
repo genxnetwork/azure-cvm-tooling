@@ -14,6 +14,7 @@ use tss_esapi::structures::{Attest, AttestInfo, Data, DigestValues, Signature, S
 use tss_esapi::tcti_ldr::{DeviceConfig, TctiNameConf};
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::Context;
+use std::fmt;
 
 #[cfg(feature = "verifier")]
 mod verify;
@@ -191,17 +192,91 @@ pub enum QuoteError {
     PcrRead,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Algorithm {
+    Sha1 = 0,
+    Sha256 = 1,
+}
+
+const SHA1_LENGTH: usize = 20;
+const SHA256_LENGTH: usize = 32;
+
+impl Algorithm {
+    pub fn length(&self) -> usize {
+        match self {
+            Algorithm::Sha1 => SHA1_LENGTH,
+            Algorithm::Sha256 => SHA256_LENGTH,
+        }
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Algorithm::Sha1 => "sha1",
+            Algorithm::Sha256 => "sha256",
+        }
+    }
+
+    pub fn tss_esapi(&self) -> tss_esapi::interface_types::algorithm::HashingAlgorithm {
+        match self {
+            Algorithm::Sha1 => tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha1,
+            Algorithm::Sha256 => tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+        }
+    }
+
+    pub fn digest(&self) -> &'static ring::digest::Algorithm {
+        match self {
+            Algorithm::Sha1 => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            Algorithm::Sha256 => &ring::digest::SHA256,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PcrBank {
+    pub algo: Algorithm,
+    pub pcr_values: Vec<Vec<u8>>,
+}
+
+
+
+impl PcrBank {
+    pub fn get(&self, index: usize) -> Option<&Vec<u8>> {
+        self.pcr_values.get(index)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Quote {
     signature: Vec<u8>,
     message: Vec<u8>,
-    pcrs: Vec<[u8; 32]>,
+    pcr_banks: Vec<PcrBank>,
+}
+
+impl fmt::Debug for PcrBank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{{\n    algo: {:?},", self.algo)?;
+        writeln!(f, "    pcr_values: [")?;
+        for vec in &self.pcr_values {
+            writeln!(f, "        \"{}\",", hex::encode(vec))?;
+        }
+        writeln!(f, "    ]\n}}")
+    }
+}
+
+impl fmt::Debug for Quote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Quote")
+            .field("signature", &hex::encode(&self.signature))
+            .field("message", &hex::encode(&self.message))
+            .field("pcr_banks", &self.pcr_banks)
+            .finish()
+    }
 }
 
 impl Quote {
-    /// Retrieve sha256 PCR values from a Quote
-    pub fn pcrs_sha256(&self) -> impl Iterator<Item = &[u8; 32]> {
-        self.pcrs.iter()
+    /// Retrieve PCR bank from a Quote
+    pub fn get_pcr_bank(&self, algo: Algorithm) -> Option<&PcrBank> {
+        self.pcr_banks.iter().filter(|bank| bank.algo == algo).next()
     }
 
     /// Extract nonce from a Quote
@@ -222,7 +297,8 @@ impl Quote {
 /// # Arguments
 ///
 /// * `data` - A byte slice to use as nonce
-pub fn get_quote(data: &[u8]) -> Result<Quote, QuoteError> {
+/// * `algorithms` - A list of hashing algorithms to use for the quote
+pub fn get_quote(data: &[u8], algorithms: Vec<Algorithm>) -> Result<Quote, QuoteError> {
     if data.len() > Data::MAX_SIZE {
         return Err(QuoteError::DataTooLarge);
     }
@@ -233,10 +309,12 @@ pub fn get_quote(data: &[u8]) -> Result<Quote, QuoteError> {
 
     let quote_data: Data = data.try_into()?;
     let scheme = SignatureScheme::Null;
-    let hash_algo = HashingAlgorithm::Sha256;
-    let selection_list = PcrSelectionListBuilder::new()
-        .with_selection(hash_algo, &VTPM_QUOTE_PCR_SLOTS)
-        .build()?;
+
+    let mut selection_list = PcrSelectionListBuilder::new();
+    for hash_algo in &algorithms {
+        selection_list = selection_list.with_selection(hash_algo.tss_esapi(), &VTPM_QUOTE_PCR_SLOTS);
+    }
+    let selection_list = selection_list.build()?;
 
     let auth_session = AuthSession::Password;
     context.set_sessions((Some(auth_session), None, None));
@@ -260,20 +338,30 @@ pub fn get_quote(data: &[u8]) -> Result<Quote, QuoteError> {
 
     context.clear_sessions();
     let pcr_data = pcr::read_all(&mut context, selection_list)?;
+    
+    fn collect_pcrs(pcr_data: &pcr::PcrData, hash_algo: HashingAlgorithm) -> Result<Vec<Vec<u8>>, QuoteError> {
+        let pcr_bank = pcr_data
+            .pcr_bank(hash_algo)
+            .ok_or(QuoteError::PcrBankNotFound)?;
+    
+        pcr_bank.into_iter()
+            .map(|(_, digest)| {
+                let digest_bytes = digest.value();
+                Ok(digest_bytes.to_vec())
+            })
+            .collect()
+    }
 
-    let pcr_bank = pcr_data
-        .pcr_bank(hash_algo)
-        .ok_or(QuoteError::PcrBankNotFound)?;
-
-    let pcrs: Result<Vec<[u8; 32]>, _> = pcr_bank
-        .into_iter()
-        .map(|(_, digest)| digest.clone().try_into().map_err(|_| QuoteError::PcrRead))
-        .collect();
-    let pcrs = pcrs?;
-
+    let mut pcr_banks = Vec::new();
+    for algorithm in algorithms {
+        let _algorithm = algorithm.tss_esapi();
+        let pcr_values = collect_pcrs(&pcr_data, _algorithm)?;
+        pcr_banks.push(PcrBank { algo: algorithm, pcr_values });
+    }
+    
     Ok(Quote {
         signature,
         message,
-        pcrs,
+        pcr_banks,
     })
 }
