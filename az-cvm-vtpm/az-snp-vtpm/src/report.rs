@@ -35,9 +35,9 @@ pub trait Validateable {
 #[cfg(feature = "verifier")]
 impl Validateable for AttestationReport {
     fn validate(&self, vcek: &Vcek) -> Result<(), ValidateError> {
-        if !is_tcb_data_valid(self) {
-            return Err(ValidateError::Tcb);
-        }
+        // if !is_tcb_data_valid(self) {
+        //     return Err(ValidateError::Tcb);
+        // }
 
         let report_sig: EcdsaSig = (&self.signature).try_into()?;
         let vcek_pubkey = vcek.0.public_key()?.ec_key()?;
