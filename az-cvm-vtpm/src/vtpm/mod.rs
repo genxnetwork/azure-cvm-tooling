@@ -1,16 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use core::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::thread;
 use thiserror::Error;
 use tss_esapi::abstraction::{nv, pcr, public::DecodedKey};
-use tss_esapi::handles::{PcrHandle, TpmHandle};
+use tss_esapi::attributes::NvIndexAttributesBuilder;
+use tss_esapi::handles::{NvIndexHandle, NvIndexTpmHandle, PcrHandle, TpmHandle};
 use tss_esapi::interface_types::algorithm::HashingAlgorithm;
-use tss_esapi::interface_types::resource_handles::NvAuth;
+use tss_esapi::interface_types::resource_handles::{NvAuth, Provision};
 use tss_esapi::interface_types::session_handles::AuthSession;
 use tss_esapi::structures::pcr_selection_list::PcrSelectionListBuilder;
 use tss_esapi::structures::pcr_slot::PcrSlot;
-use tss_esapi::structures::{Attest, AttestInfo, Data, DigestValues, Signature, SignatureScheme};
+use tss_esapi::structures::{
+    Attest, AttestInfo, Data, DigestValues, MaxNvBuffer, NvPublicBuilder, Signature,
+    SignatureScheme,
+};
 use tss_esapi::tcti_ldr::{DeviceConfig, TctiNameConf};
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::Context;
@@ -23,6 +29,7 @@ mod verify;
 pub use verify::VerifyError;
 
 const VTPM_HCL_REPORT_NV_INDEX: u32 = 0x01400001;
+const INDEX_REPORT_DATA: u32 = 0x01400002;
 const VTPM_AK_HANDLE: u32 = 0x81000003;
 const VTPM_QUOTE_PCR_SLOTS: [PcrSlot; 24] = [
     PcrSlot::Slot0,
@@ -85,20 +92,120 @@ fn to_pcr_handle(pcr: u8) -> Result<PcrHandle, ExtendError> {
 pub enum ReportError {
     #[error("tpm error")]
     Tpm(#[from] tss_esapi::Error),
+    #[error("Failed to write value to nvindex")]
+    NvWriteFailed,
 }
 
 /// Get a HCL report from an nvindex
 pub fn get_report() -> Result<Vec<u8>, ReportError> {
-    use tss_esapi::handles::NvIndexTpmHandle;
     let nv_index = NvIndexTpmHandle::new(VTPM_HCL_REPORT_NV_INDEX)?;
+    let mut context = get_session_context()?;
 
+    let report = nv::read_full(&mut context, NvAuth::Owner, nv_index)?;
+    Ok(report)
+}
+
+/// Retrieve a fresh HCL report from a nvindex. The specified report_data will be reflected
+/// in the HCL report in its user_data field and mixed into a hash in the TEE report's report_data.
+/// The Function contains a 3 seconds delay to avoid retrieving a stale report.
+pub fn get_report_with_report_data(report_data: &[u8]) -> Result<Vec<u8>, ReportError> {
+    let mut context = get_session_context()?;
+
+    let nv_index_report_data = NvIndexTpmHandle::new(INDEX_REPORT_DATA)?;
+    write_nv_index(&mut context, nv_index_report_data, report_data)?;
+
+    thread::sleep(Duration::new(3, 0));
+
+    let nv_index = NvIndexTpmHandle::new(VTPM_HCL_REPORT_NV_INDEX)?;
+    let report = nv::read_full(&mut context, NvAuth::Owner, nv_index)?;
+    Ok(report)
+}
+
+fn get_session_context() -> Result<Context, ReportError> {
     let conf: TctiNameConf = TctiNameConf::Device(DeviceConfig::default());
     let mut context = Context::new(conf)?;
     let auth_session = AuthSession::Password;
     context.set_sessions((Some(auth_session), None, None));
+    Ok(context)
+}
 
-    let report = nv::read_full(&mut context, NvAuth::Owner, nv_index)?;
-    Ok(report)
+enum NvSearchResult {
+    Found,
+    NotFound,
+    SizeMismatch,
+}
+
+fn find_index(
+    context: &mut Context,
+    nv_index: NvIndexTpmHandle,
+    len: usize,
+) -> Result<NvSearchResult, ReportError> {
+    let list = nv::list(context)?;
+    let result = list
+        .iter()
+        .find(|(public, _)| public.nv_index() == nv_index);
+    let Some((public, _)) = result else {
+        return Ok(NvSearchResult::NotFound);
+    };
+    if public.data_size() != len {
+        return Ok(NvSearchResult::SizeMismatch);
+    }
+
+    Ok(NvSearchResult::Found)
+}
+
+fn create_index(
+    context: &mut Context,
+    handle: NvIndexTpmHandle,
+    len: usize,
+) -> Result<NvIndexHandle, ReportError> {
+    let attributes = NvIndexAttributesBuilder::new()
+        .with_owner_write(true)
+        .with_owner_read(true)
+        .build()?;
+
+    let owner = NvPublicBuilder::new()
+        .with_nv_index(handle)
+        .with_index_name_algorithm(HashingAlgorithm::Sha256)
+        .with_index_attributes(attributes)
+        .with_data_area_size(len)
+        .build()?;
+
+    let index = context.nv_define_space(Provision::Owner, None, owner)?;
+    Ok(index)
+}
+
+fn resolve_handle(
+    context: &mut Context,
+    handle: NvIndexTpmHandle,
+) -> Result<NvIndexHandle, ReportError> {
+    let key_handle = context.execute_without_session(|c| c.tr_from_tpm_public(handle.into()))?;
+    Ok(key_handle.into())
+}
+
+fn delete_index(context: &mut Context, handle: NvIndexTpmHandle) -> Result<(), ReportError> {
+    let index = resolve_handle(context, handle)?;
+    context.nv_undefine_space(Provision::Owner, index)?;
+    Ok(())
+}
+
+fn write_nv_index(
+    context: &mut Context,
+    handle: NvIndexTpmHandle,
+    data: &[u8],
+) -> Result<(), ReportError> {
+    let buffer = MaxNvBuffer::try_from(data)?;
+    let result = find_index(context, handle, data.len())?;
+    let index = match result {
+        NvSearchResult::NotFound => create_index(context, handle, data.len())?,
+        NvSearchResult::SizeMismatch => {
+            delete_index(context, handle)?;
+            create_index(context, handle, data.len())?
+        }
+        NvSearchResult::Found => resolve_handle(context, handle)?,
+    };
+    context.nv_write(NvAuth::Owner, index, buffer, 0)?;
+    Ok(())
 }
 
 #[derive(Error, Debug)]
